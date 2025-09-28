@@ -1,0 +1,17 @@
+services:
+  app:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./.env
+    environment:
+      - AWS_SDK_LOAD_CONFIG=1   # allow using local AWS profile if mounted
+      # - AWS_PROFILE=dev       # optional if you rely on host profile
+    volumes:
+      - ./public:/app/../public
+      - app-tmp:/app/tmp
+    restart: unless-stopped
+
+volumes:
+  app-tmp:
