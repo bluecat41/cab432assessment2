@@ -1,12 +1,12 @@
 // backend/routes/transcode.js
 import express from 'express';
-import multer from 'multer';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn, execFile } from 'child_process';
 
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand, PutCommand, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 
@@ -16,17 +16,14 @@ const REGION       = process.env.AWS_REGION || 'ap-southeast-2';
 const S3_BUCKET    = process.env.S3_BUCKET;
 const S3_PREFIX    = (process.env.S3_PREFIX || 'videos').replace(/\/+$/,'');
 const TABLE        = process.env.DDB_TABLE  || 'n8870349_VideoMetadata';
-const FIXED_PK_VAL = process.env.QUT_USERNAME || 'n8870349@qut.edu.au'; // fixed PK
+const FIXED_PK_VAL = process.env.QUT_USERNAME || 'n8870349@qut.edu.au';
 
 const s3  = new S3Client({ region: REGION });
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
 
-// multer temp
 const tmpDir = path.join(os.tmpdir(), 'transcoder');
 fs.mkdirSync(tmpDir, { recursive: true });
-const upload = multer({ dest: tmpDir, limits: { fileSize: 1 * 1024 * 1024 * 1024 } });
 
-// helpers
 function newId() { return String(Date.now()) + '-' + Math.floor(Math.random() * 1e6); }
 function guessExt(fmt) { return (fmt || 'mp4').toLowerCase(); }
 function ownerKeyFromReq(req) {
@@ -34,40 +31,35 @@ function ownerKeyFromReq(req) {
   if (!k) throw new Error('Missing identity in token');
   return k.toLowerCase();
 }
-function composeVideoId(ownerKey, id) {
-  return `${ownerKey}#${id}`;
-}
+function composeVideoId(ownerKey, id) { return `${ownerKey}#${id}`; }
 function outKeyFor(ownerKey, id, ext) {
   const safe = encodeURIComponent(ownerKey);
   return `${S3_PREFIX}/${safe}/${id}/output.${ext}`;
 }
 
-// ddb helpers (PK fixed, SK=videoId composite)
+// DDB helpers (PK fixed, SK = videoId composite)
 async function putMeta(ownerKey, ownerEmail, id, item) {
   await ddb.send(new PutCommand({
     TableName: TABLE,
     Item: {
-      'qut-username': FIXED_PK_VAL,              // PK (constant)
-      videoId: composeVideoId(ownerKey, id),     // SK (composite)
-      id,                                        // raw id for UI
+      'qut-username': FIXED_PK_VAL,
+      videoId: composeVideoId(ownerKey, id),
+      id,
       ownerKey,
       ...(ownerEmail ? { ownerEmail } : {}),
-      createdAt: new Date().toISOString(),
       ...item
     }
   }));
 }
-
 async function patchMeta(ownerKey, id, updates) {
   const names = {}, values = {}, sets = [];
   let i = 0;
   for (const [k, v] of Object.entries(updates)) {
-    if (k === 'qut-username' || k === 'videoId') continue; // never overwrite keys
+    if (k === 'qut-username' || k === 'videoId') continue;
     const nk = `#k${i}`, nv = `:v${i}`;
     names[nk] = k; values[nv] = v; sets.push(`${nk} = ${nv}`); i++;
   }
   if (!sets.length) return;
-
   await ddb.send(new UpdateCommand({
     TableName: TABLE,
     Key: { 'qut-username': FIXED_PK_VAL, videoId: composeVideoId(ownerKey, id) },
@@ -76,7 +68,6 @@ async function patchMeta(ownerKey, id, updates) {
     ExpressionAttributeValues: values
   }));
 }
-
 async function getMeta(ownerKey, id) {
   const r = await ddb.send(new GetCommand({
     TableName: TABLE,
@@ -122,75 +113,77 @@ function extractVideoMeta(json) {
   };
 }
 
-// POST /api/transcode
-router.post('/', upload.single('video'), async (req, res) => {
+/**
+ * POST /api/transcode/start
+ * Body: { s3Key, originalFilename, format }
+ */
+router.post('/start', async (req, res) => {
   let ownerKey, ownerEmail;
   try {
-    ownerKey   = ownerKeyFromReq(req);          // e.g., email | username | sub
+    ownerKey   = ownerKeyFromReq(req);
     ownerEmail = (req.user?.email || '').toLowerCase() || null;
   } catch (e) {
     return res.status(401).json({ error: e.message });
   }
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const desiredFmt = (req.body?.format || 'mp4').toLowerCase();
-  const id         = newId();
+  const { s3Key, originalFilename, format } = req.body || {};
+  if (!s3Key) return res.status(400).json({ error: 's3Key required' });
 
-  // Define the variables that were previously missing:
-  const inputPath  = req.file.path;
-  const inputName  = req.file.originalname || 'upload';
-  const ext        = guessExt(desiredFmt);
-  const outPath    = path.join(tmpDir, `${id}.out.${ext}`);
+  const id        = newId();
+  const ext       = guessExt(format || 'mp4');
+  const inputPath = path.join(tmpDir, `${id}.src`);
+  const outPath   = path.join(tmpDir, `${id}.out.${ext}`);
 
-  // seed metadata
   await putMeta(ownerKey, ownerEmail, id, {
-    originalFilename: inputName,
+    originalFilename: originalFilename || 'upload',
+    sourceBucket: S3_BUCKET,
+    sourceKey: s3Key,
     status: 'queued',
     progress: 0,
-    outputFormat: ext,
-    startedAt: new Date().toISOString()
+    outputFormat: ext
   });
 
-  const ffmpegArgs = [
-    '-y',
-    '-i', inputPath,
-    '-c:v', ext === 'webm' ? 'libvpx-vp9' : 'libx264',
-    '-c:a', 'aac',
-    outPath
-  ];
-
   try {
-    await patchMeta(ownerKey, id, { status: 'processing', progress: 10 });
+    // Download from S3
+    await patchMeta(ownerKey, id, { status: 'downloading', progress: 5 });
+    const srcObj = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
+    await new Promise((resolve, reject) => {
+      const w = fs.createWriteStream(inputPath);
+      srcObj.Body.on('error', reject).pipe(w).on('error', reject).on('finish', resolve);
+    });
 
+    // Transcode
+    await patchMeta(ownerKey, id, { status: 'processing', progress: 20 });
+    const ffmpegArgs = ['-y','-i', inputPath, '-c:v', ext === 'webm' ? 'libvpx-vp9' : 'libx264', '-c:a', 'aac', outPath];
     await new Promise((resolve, reject) => {
       const p = spawn('ffmpeg', ffmpegArgs);
       p.on('error', reject);
-      p.stderr.on('data', () => {}); // parse progress here if desired
+      p.stderr.on('data', () => {});
       p.on('close', code => code === 0 ? resolve() : reject(new Error('ffmpeg failed: ' + code)));
     });
 
-    // Probe the output file to capture metadata
+    // Probe
     try {
       const probe = await ffprobeJSON(outPath);
       const meta  = extractVideoMeta(probe);
-      await patchMeta(ownerKey, id, { ...meta, outputFormat: ext, progress: 80 });
-    } catch (probeErr) {
-      console.warn('ffprobe failed:', probeErr?.message || probeErr);
+      await patchMeta(ownerKey, id, { ...meta, progress: 80 });
+    } catch (e) {
+      console.warn('ffprobe failed:', e?.message || e);
     }
 
+    // Upload output
     await patchMeta(ownerKey, id, { status: 'uploading', progress: 85 });
-
-    const key  = outKeyFor(ownerKey, id, ext);
-    const stat = fs.statSync(outPath);
+    const outKey = outKeyFor(ownerKey, id, ext);
+    const stat   = fs.statSync(outPath);
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
-      Key: key,
+      Key: outKey,
       Body: fs.createReadStream(outPath),
       ContentType: ext === 'mp4' ? 'video/mp4'
         : ext === 'webm' ? 'video/webm'
         : ext === 'mov' ? 'video/quicktime'
         : 'application/octet-stream',
-      Metadata: { 'original-filename': inputName }
+      Metadata: { 'original-filename': originalFilename || 'upload' }
     }));
 
     await patchMeta(ownerKey, id, {
@@ -198,8 +191,7 @@ router.post('/', upload.single('video'), async (req, res) => {
       progress: 100,
       fileSize: stat.size,
       s3Bucket: S3_BUCKET,
-      s3Key: key,
-      finishedAt: new Date().toISOString()
+      s3Key: outKey
     });
 
     try { fs.unlinkSync(inputPath); } catch {}
@@ -214,7 +206,7 @@ router.post('/', upload.single('video'), async (req, res) => {
   }
 });
 
-// GET /api/transcode/status/:id
+// STATUS
 router.get('/status/:id', async (req, res) => {
   let ownerKey;
   try { ownerKey = ownerKeyFromReq(req); } catch (e) { return res.status(401).json({ error: e.message }); }
@@ -230,29 +222,7 @@ router.get('/status/:id', async (req, res) => {
   });
 });
 
-// GET /api/transcode/download/:id
-router.get('/download/:id', async (req, res) => {
-  let ownerKey;
-  try { ownerKey = ownerKeyFromReq(req); } catch (e) { return res.status(401).json({ error: e.message }); }
-  const id = req.params.id;
-  const item = await getMeta(ownerKey, id);
-  if (!item || item.status !== 'done' || !item.s3Bucket || !item.s3Key) {
-    return res.status(404).json({ error: 'Not found or not ready' });
-  }
-
-  const ext = item.outputFormat || 'mp4';
-  const filename = (item.originalFilename || `video-${id}.${ext}`).replace(/[/\\]/g, '_').replace(/\s+/g,'_');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-  res.setHeader('Content-Type', ext === 'mp4' ? 'video/mp4'
-    : ext === 'webm' ? 'video/webm'
-    : ext === 'mov' ? 'video/quicktime'
-    : 'application/octet-stream');
-
-  const r = await s3.send(new GetObjectCommand({ Bucket: item.s3Bucket, Key: item.s3Key }));
-  r.Body.pipe(res);
-});
-
-// GET /api/transcode/list (user-scoped; fixed PK + begins_with on composite videoId)
+// LIST (user-scoped)
 router.get('/list', async (req, res) => {
   try {
     const ownerKey = ownerKeyFromReq(req);
@@ -260,16 +230,30 @@ router.get('/list', async (req, res) => {
       TableName: TABLE,
       KeyConditionExpression: '#pk = :pk AND begins_with(#vid, :prefix)',
       ExpressionAttributeNames: { '#pk': 'qut-username', '#vid': 'videoId' },
-      ExpressionAttributeValues: {
-        ':pk': FIXED_PK_VAL,
-        ':prefix': `${ownerKey}#`
-      },
+      ExpressionAttributeValues: { ':pk': FIXED_PK_VAL, ':prefix': `${ownerKey}#` },
       ScanIndexForward: false
     }));
     res.json(Array.isArray(r.Items) ? r.Items : []);
   } catch (err) {
     console.error('❌ list failed', err);
     res.status(500).json({ error: 'Failed to fetch transcode list', details: err.message });
+  }
+});
+
+// PRESIGN download (GET)
+router.get('/presign-download/:id', async (req, res) => {
+  try {
+    const ownerKey = ownerKeyFromReq(req);
+    const id = req.params.id;
+    const item = await getMeta(ownerKey, id);
+    if (!item || item.status !== 'done' || !item.s3Bucket || !item.s3Key) {
+      return res.status(404).json({ error: 'Not found or not ready' });
+    }
+    const cmd = new GetObjectCommand({ Bucket: item.s3Bucket, Key: item.s3Key });
+    const url = await getSignedUrl(s3, cmd, { expiresIn: 600 }); // 10 mins
+    res.json({ downloadUrl: url });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 

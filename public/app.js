@@ -1,171 +1,115 @@
+// public/app.js
 let token = null;
 
-// ---- Auth elements ----
-const regEmail     = document.getElementById('regEmail');
-const regUsername  = document.getElementById('regUsername');
-const regPassword  = document.getElementById('regPassword');
-const registerBtn  = document.getElementById('registerBtn');
-const registerMsg  = document.getElementById('registerMsg');
+const loginBtn    = document.getElementById('loginBtn');
+const logoutBtn   = document.getElementById('logoutBtn');
+const uploadForm  = document.getElementById('uploadForm');
+const statusBox   = document.getElementById('status');
+const statusText  = document.getElementById('statusText');
+const progressBar = document.getElementById('progressBar');
+const errorP      = document.getElementById('error');
+const downloadBtn = document.getElementById('downloadBtn');
+const authMsg     = document.getElementById('authMsg');
 
-const confirmUser  = document.getElementById('confirmUser');
-const confirmCode  = document.getElementById('confirmCode');
-const confirmBtn   = document.getElementById('confirmBtn');
-const confirmMsg   = document.getElementById('confirmMsg');
+const registerBtn = document.getElementById('registerBtn');
+const registerMsg = document.getElementById('registerMsg');
 
-const usernameEl   = document.getElementById('username');
-const passwordEl   = document.getElementById('password');
-const loginBtn     = document.getElementById('loginBtn');
-const authMsg      = document.getElementById('authMsg');
-const logoutBtn    = document.getElementById('logoutBtn');
-
-// ---- Sections ----
 const authSection    = document.getElementById('auth');
 const uploadSection  = document.getElementById('upload');
 const historySection = document.getElementById('history');
 
-// ---- Upload/status elements ----
-const uploadForm   = document.getElementById('uploadForm');
-const statusBox    = document.getElementById('status');
-const statusText   = document.getElementById('statusText');
-const progressBar  = document.getElementById('progressBar');
-const errorP       = document.getElementById('error');
-const downloadBtn  = document.getElementById('downloadBtn');
-
-// ---- Helpers ----
-function setAuthInputsHidden(hidden) {
-  [regEmail, regUsername, regPassword, registerBtn,
-   confirmUser, confirmCode, confirmBtn,
-   usernameEl, passwordEl, loginBtn].forEach(el => el.classList.toggle('hidden', hidden));
-}
-
-function onLoggedInUI() {
-  authSection.classList.add('hidden');
-  logoutBtn.classList.remove('hidden');
-  authMsg.textContent = '✅ Logged in';
-  uploadSection.classList.remove('hidden');
-  historySection.classList.remove('hidden');
-}
-
-function onLoggedOutUI() {
-  token = null;
-  setAuthInputsHidden(false);
-  authSection.classList.remove('hidden');
-  logoutBtn.classList.add('hidden');
-  authMsg.textContent = 'Logged out';
-  uploadSection.classList.add('hidden');
-  historySection.classList.add('hidden');
-  statusBox.classList.add('hidden');
-  downloadBtn.classList.add('hidden');
-  errorP.textContent = '';
-  progressBar.value = 0;
-}
-
-async function downloadWithAuth(id, ext = 'mp4') {
-  const r = await fetch(`/api/transcode/download/${id}`, {
-    headers: { Authorization: 'Bearer ' + token }
-  });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(err.error || 'Download failed');
+function setAuthUI(loggedIn) {
+  if (loggedIn) {
+    authSection.classList.add('hidden');
+    uploadSection.classList.remove('hidden');
+    logoutBtn.classList.remove('hidden');
+  } else {
+    authSection.classList.remove('hidden');
+    uploadSection.classList.add('hidden');
+    logoutBtn.classList.add('hidden');
+    historySection.classList.add('hidden');
+    token = null;
   }
-
-  let filename = `video-${id}.${ext}`;
-  const disp = r.headers.get('Content-Disposition') || '';
-  const m = /filename\*?=(?:UTF-8'')?("?)([^";]+)\1/i.exec(disp);
-  if (m && m[2]) filename = decodeURIComponent(m[2]);
-
-  const blob = await r.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
 }
 
-function fmtSize(bytes) {
-  if (typeof bytes !== 'number') return '-';
-  const units = ['B','KB','MB','GB','TB'];
-  let i = 0, n = bytes;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
-function fmtDate(iso) {
-  if (!iso) return '-';
-  try { return new Date(iso).toLocaleString(); } catch { return iso; }
+async function api(path, opts = {}) {
+  opts.headers = opts.headers || {};
+  if (token) opts.headers.Authorization = 'Bearer ' + token;
+  return fetch(path, opts);
 }
 
-// ---- Load history for the authenticated user (server enforces the user) ----
 async function loadHistory() {
-  const resp = await fetch('/api/transcode/list', {
-    headers: { Authorization: 'Bearer ' + token }
-  });
-  const videos = await resp.json().catch(() => []);
+  const resp = await api('/api/transcode/list');
+  if (!resp.ok) return;
+  const videos = await resp.json();
   const tbody = document.querySelector('#videoTable tbody');
   tbody.innerHTML = '';
-
-  (Array.isArray(videos) ? videos : []).forEach(v => {
-    const id   = v.videoId || v.id || '';
-    const fmt  = v.outputFormat || v.format || 'mp4';
-    const w    = v.width || '?';
-    const h    = v.height || '?';
-    const dur  = v.duration ? Math.round(v.duration) + 's' : '-';
-    const size = fmtSize(v.fileSize);
-    const upAt = fmtDate(v.startedAt || v.createdAt || v.uploadedAt);
-
+  videos.forEach(v => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td title="${v.originalFilename || ''}">${v.originalFilename || '-'}</td>
-      <td>${w}x${h}</td>
+      <td>${v.originalFilename || '-'}</td>
+      <td>${(v.width || '?')}x${(v.height || '?')}</td>
       <td>${v.codec || '-'}</td>
-      <td>${dur}</td>
-      <td>${fmt}</td>
-      <td>${size}</td>
-      <td>${upAt}</td>
-      <td>${v.status || '-'}</td>
-      <td>${typeof v.progress === 'number' ? v.progress : 0}%</td>
-      <td>${
-        v.status === 'done'
-          ? `<button class="dl-btn" data-id="${id}" data-ext="${fmt}">⬇</button>`
-          : '-'
-      }</td>
-      <td><button class="meta-btn" data-meta='${encodeURIComponent(JSON.stringify(v))}'>Details</button></td>
+      <td>${v.duration ? Math.round(v.duration) + 's' : '-'}</td>
+      <td>${v.ownerEmail || v.ownerKey || '-'}</td>
     `;
     tbody.appendChild(tr);
   });
-
+  
   historySection.classList.remove('hidden');
 }
 
-// ---- Table actions (download + quick metadata view) ----
 document.getElementById('history').addEventListener('click', async (e) => {
-  const t = e.target;
-  if (t.classList.contains('dl-btn')) {
-    const vid = t.getAttribute('data-id');
-    const ext = t.getAttribute('data-ext') || 'mp4';
-    try { await downloadWithAuth(vid, ext); } catch (err) { alert(err.message); }
-    return;
-  }
-  if (t.classList.contains('meta-btn')) {
+  if (e.target.classList.contains('dl-btn')) {
+    const id = e.target.getAttribute('data-id');
     try {
-      const raw = t.getAttribute('data-meta') || '';
-      const obj = JSON.parse(decodeURIComponent(raw));
-      alert(JSON.stringify(obj, null, 2)); // simple quick view
+      const r = await api(`/api/transcode/presign-download/${id}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Failed to presign download');
+      const a = document.createElement('a');
+      a.href = j.downloadUrl;
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     } catch (err) {
-      alert('Could not parse metadata: ' + err.message);
+      alert(err.message);
     }
   }
 });
 
-// ---- Auth flows ----
+loginBtn.addEventListener('click', async () => {
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  try {
+    const resp = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Login failed');
+    token = data.idToken || data.token; // prefer ID token (has email)
+    authMsg.textContent = '✅ Logged in';
+    setAuthUI(true);
+    await loadHistory();
+  } catch (err) {
+    authMsg.textContent = '❌ ' + err.message;
+  }
+});
+
+logoutBtn.addEventListener('click', () => {
+  token = null;
+  authMsg.textContent = 'Logged out';
+  setAuthUI(false);
+});
+
 registerBtn.addEventListener('click', async () => {
-  const username = regUsername.value.trim();
-  const password = regPassword.value.trim();
-  const email    = regEmail.value.trim();
+  const username = document.getElementById('regUsername').value;
+  const password = document.getElementById('regPassword').value;
+  const email    = document.getElementById('regEmail').value;
   if (!username || !password || !email) {
-    registerMsg.textContent = '❌ Please enter email, username and password';
+    registerMsg.textContent = '❌ Enter username, password, email';
     return;
   }
   try {
@@ -176,119 +120,103 @@ registerBtn.addEventListener('click', async () => {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Registration failed');
-    registerMsg.textContent = '✅ Registered. Please check your email for the confirmation code.';
+    const where = data.codeDelivery?.Destination ? ` → ${data.codeDelivery.Destination}` : '';
+    registerMsg.textContent = '✅ Registered. Check your email for a code' + where;
   } catch (err) {
     registerMsg.textContent = '❌ ' + err.message;
   }
 });
 
-confirmBtn.addEventListener('click', async () => {
-  const username = confirmUser.value.trim();
-  const code     = confirmCode.value.trim();
-  if (!username || !code) {
-    confirmMsg.textContent = '❌ Please enter username and code';
-    return;
-  }
-  try {
-    const resp = await fetch('/api/confirm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, code })
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'Confirmation failed');
-    confirmMsg.textContent = '✅ Account confirmed. You can now log in.';
-  } catch (err) {
-    confirmMsg.textContent = '❌ ' + err.message;
-  }
-});
+function uploadWithProgress(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream'); // <-- add this
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && typeof onProgress === 'function') {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+    xhr.onload  = () => (xhr.status >= 200 && xhr.status < 300)
+      ? resolve()
+      : reject(new Error('S3 upload failed: ' + xhr.status));
+    xhr.onerror = () => reject(new Error('S3 upload network error'));
+    xhr.send(file);
+  });
+}
 
-loginBtn.addEventListener('click', async () => {
-  const username = usernameEl.value.trim();
-  const password = passwordEl.value.trim();
-  try {
-    const resp = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'Login failed');
-    token = data.token || data.idToken || data.accessToken;
-    if (!token) throw new Error('No token returned from server');
-    onLoggedInUI();
-    await loadHistory();
-  } catch (err) {
-    authMsg.textContent = '❌ ' + err.message;
-  }
-});
-
-logoutBtn.addEventListener('click', () => {
-  onLoggedOutUI();
-});
-
-// ---- Upload flow ----
 uploadForm.addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (!token) {
-    errorP.textContent = 'Please log in first.';
-    return;
-  }
-  const fileInput   = document.getElementById('video');
-  const formatEl    = document.getElementById('format');
-  const chosenFormat= formatEl ? formatEl.value : 'mp4';
+  const fileInput = document.getElementById('video');
+  const formatEl  = document.getElementById('format');
+  const chosenFmt = formatEl ? formatEl.value : 'mp4';
   if (!fileInput.files.length) return;
 
+  const file = fileInput.files[0];
+
   statusBox.classList.remove('hidden');
-  statusText.textContent = 'Uploading...';
+  statusText.textContent = 'Requesting upload URL...';
   progressBar.value = 0;
   errorP.textContent = '';
   downloadBtn.classList.add('hidden');
   downloadBtn.onclick = null;
 
-  const data = new FormData();
-  data.append('video', fileInput.files[0]);
-  data.append('format', chosenFormat);
-
-  const resp = await fetch('/api/transcode', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + token },
-    body: data
-  });
-
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    errorP.textContent = body.error || 'Upload failed';
-    return;
-  }
-
-  const { id, outputFormat } = body;
-  let extHint = outputFormat || chosenFormat || 'mp4';
-
-  const poll = setInterval(async () => {
-    const r = await fetch(`/api/transcode/status/${id}`, {
-      headers: { Authorization: 'Bearer ' + token }
+  try {
+    // 1) Request presigned PUT
+    const pre = await api('/api/s3/presign-upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, contentType: file.type || 'application/octet-stream' })
     });
-    const s = await r.json().catch(() => ({}));
-    statusText.textContent = s.status || 'processing';
-    progressBar.value = s.progress || 0;
+    const p = await pre.json();
+    if (!pre.ok) throw new Error(p.error || 'Failed to get presigned URL');
 
-    if (s.status === 'done') {
-      clearInterval(poll);
-      const ext = s.outputFormat || extHint || 'mp4';
-      downloadBtn.classList.remove('hidden');
-      downloadBtn.onclick = async () => {
-        try { await downloadWithAuth(id, ext); }
-        catch (err) { errorP.textContent = err.message; }
-      };
-      await loadHistory();
-    }
-    if (s.status === 'error') {
-      clearInterval(poll);
-      errorP.textContent = s.error || 'Unknown error during transcode';
-    }
-  }, 1500);
+    // 2) Upload directly to S3 with progress
+    statusText.textContent = 'Uploading to S3...';
+    await uploadWithProgress(p.uploadUrl, file, (pct) => {
+      progressBar.value = pct;
+    });
+
+    // 3) Start transcode from S3 object
+    statusText.textContent = 'Queuing transcode...';
+    const startResp = await api('/api/transcode/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        s3Key: p.key,
+        originalFilename: file.name,
+        format: chosenFmt
+      })
+    });
+    const start = await startResp.json();
+    if (!startResp.ok) throw new Error(start.error || 'Failed to start transcode');
+    const { id } = start;
+
+    // 4) Poll status
+    const poll = setInterval(async () => {
+      const r = await api(`/api/transcode/status/${id}`);
+      const s = await r.json();
+      if (!r.ok) { clearInterval(poll); throw new Error(s.error || 'Status failed'); }
+      statusText.textContent = s.status;
+      progressBar.value = s.progress || 0;
+
+      if (s.status === 'done') {
+        clearInterval(poll);
+        downloadBtn.classList.remove('hidden');
+        downloadBtn.onclick = async () => {
+          const d = await api(`/api/transcode/presign-download/${id}`);
+          const j = await d.json();
+          if (!d.ok) return alert(j.error || 'Download failed');
+          window.location.href = j.downloadUrl;
+        };
+        await loadHistory();
+      }
+      if (s.status === 'error') {
+        clearInterval(poll);
+        errorP.textContent = s.error || 'Transcode error';
+      }
+    }, 1500);
+  } catch (err) {
+    errorP.textContent = err.message;
+  }
 });
-
-// ---- Initial UI ----
-onLoggedOutUI();

@@ -3,7 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <title>Video Transcoder</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  connect-src 'self' https://*.s3.ap-southeast-2.amazonaws.com;
+  img-src 'self' data: blob: https://*.s3.ap-southeast-2.amazonaws.com;
+  media-src 'self' blob: https://*.s3.ap-southeast-2.amazonaws.com;
+"/>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; }
     .hidden { display: none; }
@@ -79,13 +84,7 @@
           <th>WxH</th>
           <th>Codec</th>
           <th>Duration</th>
-          <th>Format</th>
-          <th>Size</th>
-          <th>Uploaded</th>
-          <th>Status</th>
-          <th>Progress</th>
-          <th>Download</th>
-          <th>Details</th>
+          <th>Owner</th>
         </tr>
       </thead>
       <tbody></tbody>
