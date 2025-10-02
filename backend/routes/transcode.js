@@ -36,6 +36,14 @@ function outKeyFor(ownerKey, id, ext) {
   const safe = encodeURIComponent(ownerKey);
   return `${S3_PREFIX}/${safe}/${id}/output.${ext}`;
 }
+function safeFilename(name, fallbackExt = 'mp4') {
+  const ext = path.extname(name || '')?.slice(1) || fallbackExt;
+  const base = path
+    .basename(name || `video.${ext}`, '.' + ext)
+    .replace(/[^\w.-]+/g, '_')
+    .slice(0, 100) || 'video';
+  return `${base}.${ext}`;
+}
 
 // DDB helpers (PK fixed, SK = videoId composite)
 async function putMeta(ownerKey, ownerEmail, id, item) {
@@ -115,7 +123,7 @@ function extractVideoMeta(json) {
 
 /**
  * POST /api/transcode/start
- * Body: { s3Key, originalFilename, format }
+ * Body: { s3Key, originalFilename, format, originalSizeBytes?, uploadedAt? }
  */
 router.post('/start', async (req, res) => {
   let ownerKey, ownerEmail;
@@ -126,7 +134,13 @@ router.post('/start', async (req, res) => {
     return res.status(401).json({ error: e.message });
   }
 
-  const { s3Key, originalFilename, format } = req.body || {};
+  const {
+    s3Key,
+    originalFilename,
+    format,
+    originalSizeBytes,   // optional from client
+    uploadedAt           // optional from client (ISO)
+  } = req.body || {};
   if (!s3Key) return res.status(400).json({ error: 's3Key required' });
 
   const id        = newId();
@@ -134,19 +148,42 @@ router.post('/start', async (req, res) => {
   const inputPath = path.join(tmpDir, `${id}.src`);
   const outPath   = path.join(tmpDir, `${id}.out.${ext}`);
 
+  // Normalize timestamps
+  const nowIso = new Date().toISOString();
+  const uploadedAtIso = uploadedAt && !isNaN(new Date(uploadedAt))
+    ? new Date(uploadedAt).toISOString()
+    : nowIso;
+
+  // Initial metadata (queued state) with size & upload time if provided
   await putMeta(ownerKey, ownerEmail, id, {
     originalFilename: originalFilename || 'upload',
     sourceBucket: S3_BUCKET,
     sourceKey: s3Key,
     status: 'queued',
     progress: 0,
-    outputFormat: ext
+    outputFormat: ext,
+    // NEW fields for the UI
+    originalSizeBytes: Number.isFinite(Number(originalSizeBytes)) ? Number(originalSizeBytes) : null,
+    uploadedAt: uploadedAtIso,
+    createdAt: nowIso
   });
 
   try {
     // Download from S3
     await patchMeta(ownerKey, id, { status: 'downloading', progress: 5 });
+
     const srcObj = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
+    // If S3 gives us authoritative values, patch them in
+    const s3Len = typeof srcObj.ContentLength === 'number' ? srcObj.ContentLength : null;
+    const s3UploadedAt = srcObj.LastModified instanceof Date ? srcObj.LastModified.toISOString() : null;
+    if (s3Len != null || s3UploadedAt) {
+      await patchMeta(ownerKey, id, {
+        inputSizeBytes: s3Len ?? null,
+        // Only override if client did not provide
+        ...(s3UploadedAt && uploadedAt == null ? { uploadedAt: s3UploadedAt } : {})
+      });
+    }
+
     await new Promise((resolve, reject) => {
       const w = fs.createWriteStream(inputPath);
       srcObj.Body.on('error', reject).pipe(w).on('error', reject).on('finish', resolve);
@@ -175,6 +212,7 @@ router.post('/start', async (req, res) => {
     await patchMeta(ownerKey, id, { status: 'uploading', progress: 85 });
     const outKey = outKeyFor(ownerKey, id, ext);
     const stat   = fs.statSync(outPath);
+    const downloadName = safeFilename(originalFilename, ext); // <-- use original name for download
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: outKey,
@@ -183,15 +221,19 @@ router.post('/start', async (req, res) => {
         : ext === 'webm' ? 'video/webm'
         : ext === 'mov' ? 'video/quicktime'
         : 'application/octet-stream',
+      ContentDisposition: `attachment; filename="${downloadName}"`, // <-- force download if hit directly
       Metadata: { 'original-filename': originalFilename || 'upload' }
     }));
 
     await patchMeta(ownerKey, id, {
       status: 'done',
       progress: 100,
+      // Back-compat + clearer name
       fileSize: stat.size,
+      outputSizeBytes: stat.size,
       s3Bucket: S3_BUCKET,
-      s3Key: outKey
+      s3Key: outKey,
+      completedAt: new Date().toISOString()
     });
 
     try { fs.unlinkSync(inputPath); } catch {}
@@ -218,7 +260,11 @@ router.get('/status/:id', async (req, res) => {
     status: item.status || 'unknown',
     progress: item.progress || 0,
     outputFormat: item.outputFormat,
-    error: item.error || null
+    error: item.error || null,
+    // Extras (optional for your UI)
+    uploadedAt: item.uploadedAt || null,
+    originalSizeBytes: item.originalSizeBytes ?? item.inputSizeBytes ?? null,
+    outputSizeBytes: item.outputSizeBytes ?? item.fileSize ?? null
   });
 });
 
@@ -233,6 +279,7 @@ router.get('/list', async (req, res) => {
       ExpressionAttributeValues: { ':pk': FIXED_PK_VAL, ':prefix': `${ownerKey}#` },
       ScanIndexForward: false
     }));
+    // Return full items; front-end tolerates multiple name variants
     res.json(Array.isArray(r.Items) ? r.Items : []);
   } catch (err) {
     console.error('❌ list failed', err);
@@ -249,7 +296,16 @@ router.get('/presign-download/:id', async (req, res) => {
     if (!item || item.status !== 'done' || !item.s3Bucket || !item.s3Key) {
       return res.status(404).json({ error: 'Not found or not ready' });
     }
-    const cmd = new GetObjectCommand({ Bucket: item.s3Bucket, Key: item.s3Key });
+    // Nice download name: prefer original filename + actual output ext
+    const extFromKey = path.extname(item.s3Key || '').slice(1) || (item.outputFormat || 'mp4');
+    const downloadName = safeFilename(item.originalFilename || `video.${extFromKey}`, extFromKey);
+
+    const cmd = new GetObjectCommand({
+      Bucket: item.s3Bucket,
+      Key: item.s3Key,
+      // Force download even if the object metadata lacked it
+      ResponseContentDisposition: `attachment; filename="${downloadName}"`
+    });
     const url = await getSignedUrl(s3, cmd, { expiresIn: 600 }); // 10 mins
     res.json({ downloadUrl: url });
   } catch (e) {

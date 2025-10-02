@@ -1,5 +1,6 @@
 // public/app.js
 let token = null;
+let currentPoll = null; // track active status poll so we can cancel on logout
 
 const loginBtn    = document.getElementById('loginBtn');
 const logoutBtn   = document.getElementById('logoutBtn');
@@ -18,17 +19,67 @@ const authSection    = document.getElementById('auth');
 const uploadSection  = document.getElementById('upload');
 const historySection = document.getElementById('history');
 
+// ---------- Helpers ----------
+function formatBytes(bytes) {
+  if (bytes == null || isNaN(bytes)) return '-';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0, num = Number(bytes);
+  while (num >= 1024 && i < units.length - 1) { num /= 1024; i++; }
+  const precise = num < 10 && i > 0 ? 1 : 0;
+  return `${num.toFixed(precise)} ${units[i]}`;
+}
+
+function formatDate(value) {
+  if (!value) return '-';
+  const d = typeof value === 'number' ? new Date(value) : new Date(String(value));
+  if (isNaN(d)) return '-';
+  const pad = n => String(n).padStart(2, '0');
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const min = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+}
+
+function resetStatusUI() {
+  // hide/clear the status area (the "done / Download" bar)
+  statusBox.classList.add('hidden');
+  statusText.textContent = '';
+  progressBar.value = 0;
+  errorP.textContent = '';
+  downloadBtn.classList.add('hidden');
+  downloadBtn.onclick = null;
+  // stop any ongoing polling
+  if (currentPoll) {
+    clearInterval(currentPoll);
+    currentPoll = null;
+  }
+}
+
+function clearHistoryUI() {
+  const tbody = document.querySelector('#videoTable tbody');
+  if (tbody) tbody.innerHTML = '';
+  historySection.classList.add('hidden');
+}
+// -----------------------------
+
 function setAuthUI(loggedIn) {
   if (loggedIn) {
     authSection.classList.add('hidden');
     uploadSection.classList.remove('hidden');
     logoutBtn.classList.remove('hidden');
+    // keep the table for this user; just reset the status UI
+    resetStatusUI();
   } else {
     authSection.classList.remove('hidden');
     uploadSection.classList.add('hidden');
     logoutBtn.classList.add('hidden');
     historySection.classList.add('hidden');
     token = null;
+    // on logout, hide status and clear the table to avoid showing previous user's data
+    resetStatusUI();
+    clearHistoryUI();
   }
 }
 
@@ -41,21 +92,34 @@ async function api(path, opts = {}) {
 async function loadHistory() {
   const resp = await api('/api/transcode/list');
   if (!resp.ok) return;
+
   const videos = await resp.json();
   const tbody = document.querySelector('#videoTable tbody');
   tbody.innerHTML = '';
+
   videos.forEach(v => {
+    const size = v.sizeBytes ?? v.originalSizeBytes ?? v.inputSizeBytes;
+    const uploaded = v.uploadedAt ?? v.createdAt ?? v.startedAt;
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${v.originalFilename || '-'}</td>
       <td>${(v.width || '?')}x${(v.height || '?')}</td>
       <td>${v.codec || '-'}</td>
       <td>${v.duration ? Math.round(v.duration) + 's' : '-'}</td>
-      <td>${v.ownerEmail || v.ownerKey || '-'}</td>
+      <td>${formatBytes(size)}</td>
+      <td>${formatDate(uploaded)}</td>
+      <td>${v.status || '-'}</td>
+      <td>${v.progress != null ? v.progress + '%' : (v.status === 'done' ? '100%' : '0%')}</td>
+      <td>${
+        v.status === 'done'
+          ? `<button class="dl-btn" data-id="${v.id}" title="Download">⬇</button>`
+          : '-'
+      }</td>
     `;
     tbody.appendChild(tr);
   });
-  
+
   historySection.classList.remove('hidden');
 }
 
@@ -91,8 +155,8 @@ loginBtn.addEventListener('click', async () => {
     if (!resp.ok) throw new Error(data.error || 'Login failed');
     token = data.idToken || data.token; // prefer ID token (has email)
     authMsg.textContent = '✅ Logged in';
-    setAuthUI(true);
-    await loadHistory();
+    setAuthUI(true);          // resets status UI, keeps table visible
+    await loadHistory();      // fetch and show this user's historical videos
   } catch (err) {
     authMsg.textContent = '❌ ' + err.message;
   }
@@ -101,6 +165,9 @@ loginBtn.addEventListener('click', async () => {
 logoutBtn.addEventListener('click', () => {
   token = null;
   authMsg.textContent = 'Logged out';
+  // hide/clear the status area and clear table for privacy
+  resetStatusUI();
+  clearHistoryUI();
   setAuthUI(false);
 });
 
@@ -131,7 +198,7 @@ function uploadWithProgress(url, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', url, true);
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream'); // <-- add this
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream'); // must match presign
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && typeof onProgress === 'function') {
         onProgress(Math.round((e.loaded / e.total) * 100));
@@ -161,12 +228,21 @@ uploadForm.addEventListener('submit', async (e) => {
   downloadBtn.classList.add('hidden');
   downloadBtn.onclick = null;
 
+  // If another poll is running (previous user/session), stop it
+  if (currentPoll) {
+    clearInterval(currentPoll);
+    currentPoll = null;
+  }
+
   try {
     // 1) Request presigned PUT
     const pre = await api('/api/s3/presign-upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: file.name, contentType: file.type || 'application/octet-stream' })
+      body: JSON.stringify({
+        filename: file.name,
+        contentType: file.type || 'application/octet-stream'
+      })
     });
     const p = await pre.json();
     if (!pre.ok) throw new Error(p.error || 'Failed to get presigned URL');
@@ -177,7 +253,7 @@ uploadForm.addEventListener('submit', async (e) => {
       progressBar.value = pct;
     });
 
-    // 3) Start transcode from S3 object
+    // 3) Start transcode from S3 object (include size & upload time)
     statusText.textContent = 'Queuing transcode...';
     const startResp = await api('/api/transcode/start', {
       method: 'POST',
@@ -185,7 +261,9 @@ uploadForm.addEventListener('submit', async (e) => {
       body: JSON.stringify({
         s3Key: p.key,
         originalFilename: file.name,
-        format: chosenFmt
+        format: chosenFmt,
+        originalSizeBytes: file.size,
+        uploadedAt: new Date().toISOString()
       })
     });
     const start = await startResp.json();
@@ -193,26 +271,38 @@ uploadForm.addEventListener('submit', async (e) => {
     const { id } = start;
 
     // 4) Poll status
-    const poll = setInterval(async () => {
+    currentPoll = setInterval(async () => {
       const r = await api(`/api/transcode/status/${id}`);
       const s = await r.json();
-      if (!r.ok) { clearInterval(poll); throw new Error(s.error || 'Status failed'); }
+      if (!r.ok) {
+        clearInterval(currentPoll);
+        currentPoll = null;
+        throw new Error(s.error || 'Status failed');
+      }
       statusText.textContent = s.status;
       progressBar.value = s.progress || 0;
 
       if (s.status === 'done') {
-        clearInterval(poll);
+        clearInterval(currentPoll);
+        currentPoll = null;
         downloadBtn.classList.remove('hidden');
         downloadBtn.onclick = async () => {
           const d = await api(`/api/transcode/presign-download/${id}`);
           const j = await d.json();
           if (!d.ok) return alert(j.error || 'Download failed');
-          window.location.href = j.downloadUrl;
+          const a = document.createElement('a');
+          a.href = j.downloadUrl;
+          a.download = ''; // ignored cross-origin, but server header now forces download
+          a.rel = 'noopener';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
         };
         await loadHistory();
       }
       if (s.status === 'error') {
-        clearInterval(poll);
+        clearInterval(currentPoll);
+        currentPoll = null;
         errorP.textContent = s.error || 'Transcode error';
       }
     }, 1500);
