@@ -25,7 +25,6 @@ const tmpDir = path.join(os.tmpdir(), 'transcoder');
 fs.mkdirSync(tmpDir, { recursive: true });
 
 function newId() { return String(Date.now()) + '-' + Math.floor(Math.random() * 1e6); }
-function guessExt(fmt) { return (fmt || 'mp4').toLowerCase(); }
 function ownerKeyFromReq(req) {
   const k = req.user?.identityKey || req.user?.email;
   if (!k) throw new Error('Missing identity in token');
@@ -36,16 +35,57 @@ function outKeyFor(ownerKey, id, ext) {
   const safe = encodeURIComponent(ownerKey);
   return `${S3_PREFIX}/${safe}/${id}/output.${ext}`;
 }
-function safeFilename(name, fallbackExt = 'mp4') {
-  const ext = path.extname(name || '')?.slice(1) || fallbackExt;
-  const base = path
-    .basename(name || `video.${ext}`, '.' + ext)
-    .replace(/[^\w.-]+/g, '_')
-    .slice(0, 100) || 'video';
-  return `${base}.${ext}`;
+
+/** Always force the download name to the target extension (don’t use the original ext) */
+function makeDownloadName(originalName, forcedExt = 'mp4') {
+  const base = path.basename(originalName || 'video', path.extname(originalName || ''));
+  const clean = (base || 'video').replace(/[^\w.-]+/g, '_').slice(0, 100) || 'video';
+  return `${clean}.${String(forcedExt || 'mp4').toLowerCase()}`;
 }
 
-// DDB helpers (PK fixed, SK = videoId composite)
+// --- Transcode helpers ---
+function normalizeExt(fmt) {
+  const e = String(fmt || 'mp4').toLowerCase();
+  return ['mp4', 'webm', 'mov'].includes(e) ? e : 'mp4';
+}
+function buildFfmpegArgs(inputPath, ext, outPath) {
+  if (ext === 'mp4') {
+    return [
+      '-y', '-hide_banner',
+      '-i', inputPath,
+      '-c:v', 'libx264',
+      '-preset', 'medium',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-c:a', 'aac', '-b:a', '192k',
+      '-f', 'mp4',
+      outPath
+    ];
+  }
+  if (ext === 'webm') {
+    return [
+      '-y', '-hide_banner',
+      '-i', inputPath,
+      '-c:v', 'libvpx-vp9',
+      '-b:v', '0', '-crf', '30',
+      '-c:a', 'libopus',
+      '-f', 'webm',
+      outPath
+    ];
+  }
+  // MOV output
+  return [
+    '-y', '-hide_banner',
+    '-i', inputPath,
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '192k',
+    '-f', 'mov',
+    outPath
+  ];
+}
+
+// --- DDB helpers (PK fixed, SK = videoId composite) ---
 async function putMeta(ownerKey, ownerEmail, id, item) {
   await ddb.send(new PutCommand({
     TableName: TABLE,
@@ -84,7 +124,7 @@ async function getMeta(ownerKey, id) {
   return r.Item;
 }
 
-// ffprobe helpers
+// --- ffprobe helpers ---
 function ffprobeJSON(filePath) {
   return new Promise((resolve, reject) => {
     execFile('ffprobe', [
@@ -138,23 +178,21 @@ router.post('/start', async (req, res) => {
     s3Key,
     originalFilename,
     format,
-    originalSizeBytes,   // optional from client
-    uploadedAt           // optional from client (ISO)
+    originalSizeBytes,
+    uploadedAt
   } = req.body || {};
   if (!s3Key) return res.status(400).json({ error: 's3Key required' });
 
   const id        = newId();
-  const ext       = guessExt(format || 'mp4');
+  const ext       = normalizeExt(format || 'mp4');
   const inputPath = path.join(tmpDir, `${id}.src`);
   const outPath   = path.join(tmpDir, `${id}.out.${ext}`);
 
-  // Normalize timestamps
   const nowIso = new Date().toISOString();
   const uploadedAtIso = uploadedAt && !isNaN(new Date(uploadedAt))
     ? new Date(uploadedAt).toISOString()
     : nowIso;
 
-  // Initial metadata (queued state) with size & upload time if provided
   await putMeta(ownerKey, ownerEmail, id, {
     originalFilename: originalFilename || 'upload',
     sourceBucket: S3_BUCKET,
@@ -162,36 +200,32 @@ router.post('/start', async (req, res) => {
     status: 'queued',
     progress: 0,
     outputFormat: ext,
-    // NEW fields for the UI
     originalSizeBytes: Number.isFinite(Number(originalSizeBytes)) ? Number(originalSizeBytes) : null,
     uploadedAt: uploadedAtIso,
     createdAt: nowIso
   });
 
   try {
-    // Download from S3
+    // Download source
     await patchMeta(ownerKey, id, { status: 'downloading', progress: 5 });
-
     const srcObj = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
-    // If S3 gives us authoritative values, patch them in
     const s3Len = typeof srcObj.ContentLength === 'number' ? srcObj.ContentLength : null;
     const s3UploadedAt = srcObj.LastModified instanceof Date ? srcObj.LastModified.toISOString() : null;
     if (s3Len != null || s3UploadedAt) {
       await patchMeta(ownerKey, id, {
         inputSizeBytes: s3Len ?? null,
-        // Only override if client did not provide
         ...(s3UploadedAt && uploadedAt == null ? { uploadedAt: s3UploadedAt } : {})
       });
     }
-
     await new Promise((resolve, reject) => {
       const w = fs.createWriteStream(inputPath);
       srcObj.Body.on('error', reject).pipe(w).on('error', reject).on('finish', resolve);
     });
 
-    // Transcode
+    // Transcode (force container & flags)
     await patchMeta(ownerKey, id, { status: 'processing', progress: 20 });
-    const ffmpegArgs = ['-y','-i', inputPath, '-c:v', ext === 'webm' ? 'libvpx-vp9' : 'libx264', '-c:a', 'aac', outPath];
+    const ffmpegArgs = buildFfmpegArgs(inputPath, ext, outPath);
+    console.log('🔧 ffmpeg args:', ffmpegArgs.join(' '));
     await new Promise((resolve, reject) => {
       const p = spawn('ffmpeg', ffmpegArgs);
       p.on('error', reject);
@@ -199,20 +233,23 @@ router.post('/start', async (req, res) => {
       p.on('close', code => code === 0 ? resolve() : reject(new Error('ffmpeg failed: ' + code)));
     });
 
-    // Probe
+    // Probe output
     try {
       const probe = await ffprobeJSON(outPath);
       const meta  = extractVideoMeta(probe);
+      if (ext === 'mp4' && probe?.format?.format_name && !/mp4|isom/i.test(probe.format.format_name)) {
+        console.warn('⚠️ Expected MP4 container but got:', probe.format.format_name);
+      }
       await patchMeta(ownerKey, id, { ...meta, progress: 80 });
     } catch (e) {
       console.warn('ffprobe failed:', e?.message || e);
     }
 
-    // Upload output
+    // Upload output (force download filename to target ext)
     await patchMeta(ownerKey, id, { status: 'uploading', progress: 85 });
     const outKey = outKeyFor(ownerKey, id, ext);
     const stat   = fs.statSync(outPath);
-    const downloadName = safeFilename(originalFilename, ext); // <-- use original name for download
+    const downloadName = makeDownloadName(originalFilename, ext);
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: outKey,
@@ -221,14 +258,13 @@ router.post('/start', async (req, res) => {
         : ext === 'webm' ? 'video/webm'
         : ext === 'mov' ? 'video/quicktime'
         : 'application/octet-stream',
-      ContentDisposition: `attachment; filename="${downloadName}"`, // <-- force download if hit directly
+      ContentDisposition: `attachment; filename="${downloadName}"`,
       Metadata: { 'original-filename': originalFilename || 'upload' }
     }));
 
     await patchMeta(ownerKey, id, {
       status: 'done',
       progress: 100,
-      // Back-compat + clearer name
       fileSize: stat.size,
       outputSizeBytes: stat.size,
       s3Bucket: S3_BUCKET,
@@ -261,7 +297,6 @@ router.get('/status/:id', async (req, res) => {
     progress: item.progress || 0,
     outputFormat: item.outputFormat,
     error: item.error || null,
-    // Extras (optional for your UI)
     uploadedAt: item.uploadedAt || null,
     originalSizeBytes: item.originalSizeBytes ?? item.inputSizeBytes ?? null,
     outputSizeBytes: item.outputSizeBytes ?? item.fileSize ?? null
@@ -279,7 +314,6 @@ router.get('/list', async (req, res) => {
       ExpressionAttributeValues: { ':pk': FIXED_PK_VAL, ':prefix': `${ownerKey}#` },
       ScanIndexForward: false
     }));
-    // Return full items; front-end tolerates multiple name variants
     res.json(Array.isArray(r.Items) ? r.Items : []);
   } catch (err) {
     console.error('❌ list failed', err);
@@ -296,14 +330,13 @@ router.get('/presign-download/:id', async (req, res) => {
     if (!item || item.status !== 'done' || !item.s3Bucket || !item.s3Key) {
       return res.status(404).json({ error: 'Not found or not ready' });
     }
-    // Nice download name: prefer original filename + actual output ext
     const extFromKey = path.extname(item.s3Key || '').slice(1) || (item.outputFormat || 'mp4');
-    const downloadName = safeFilename(item.originalFilename || `video.${extFromKey}`, extFromKey);
+    const downloadName = makeDownloadName(item.originalFilename, extFromKey);
 
     const cmd = new GetObjectCommand({
       Bucket: item.s3Bucket,
       Key: item.s3Key,
-      // Force download even if the object metadata lacked it
+      // Force correct filename extension on download
       ResponseContentDisposition: `attachment; filename="${downloadName}"`
     });
     const url = await getSignedUrl(s3, cmd, { expiresIn: 600 }); // 10 mins

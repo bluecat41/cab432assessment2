@@ -47,9 +47,24 @@
       <button id="loginBtn">Login</button>
       <span id="authMsg"></span>
     </div>
+    <!-- MFA step (shown after username+password if email OTP is required) -->
+<section id="mfa" class="hidden">
+  <h3>Verification required</h3>
+  <p id="mfaMsg">We sent a code to your email. Enter it below.</p>
+  <div class="row">
+    <label for="mfaCode">Code</label>
+    <input id="mfaCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" />
+  </div>
+  <div class="row">
+    <button id="mfaSubmitBtn">Verify</button>
+    <button id="mfaResendBtn" type="button">Resend code</button>
+  </div>
+</section>
+
   </section>
 
   <!-- Logout lives OUTSIDE the auth section -->
+  <div id="welcomeBox" class="hidden">Welcome, <strong id="welcomeName"></strong>!</div>
   <div class="row">
     <button id="logoutBtn" class="hidden">Logout</button>
   </div>

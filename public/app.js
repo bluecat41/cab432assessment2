@@ -2,6 +2,14 @@
 let token = null;
 let currentPoll = null; // track active status poll so we can cancel on logout
 
+// Keep last login creds so we can "resend" MFA code by retrying /login
+let lastLogin = { username: null, password: null };
+
+// MFA state
+let mfaSession = null;
+let mfaChallengeName = null;
+let mfaUsername = null;
+
 const loginBtn    = document.getElementById('loginBtn');
 const logoutBtn   = document.getElementById('logoutBtn');
 const uploadForm  = document.getElementById('uploadForm');
@@ -14,6 +22,21 @@ const authMsg     = document.getElementById('authMsg');
 
 const registerBtn = document.getElementById('registerBtn');
 const registerMsg = document.getElementById('registerMsg');
+
+// Confirm UI (account confirmation)
+const confirmBtn  = document.getElementById('confirmBtn');
+const resendBtn   = document.getElementById('resendBtn');   // optional
+const confirmMsg  = document.getElementById('confirmMsg');  // optional
+
+// MFA UI
+const mfaSection   = document.getElementById('mfa');
+const mfaMsg       = document.getElementById('mfaMsg');
+const mfaCodeInput = document.getElementById('mfaCode');
+const mfaSubmitBtn = document.getElementById('mfaSubmitBtn');
+const mfaResendBtn = document.getElementById('mfaResendBtn');
+
+const welcomeBox  = document.getElementById('welcomeBox');  // optional
+const welcomeName = document.getElementById('welcomeName'); // optional
 
 const authSection    = document.getElementById('auth');
 const uploadSection  = document.getElementById('upload');
@@ -43,14 +66,12 @@ function formatDate(value) {
 }
 
 function resetStatusUI() {
-  // hide/clear the status area (the "done / Download" bar)
   statusBox.classList.add('hidden');
   statusText.textContent = '';
   progressBar.value = 0;
   errorP.textContent = '';
   downloadBtn.classList.add('hidden');
   downloadBtn.onclick = null;
-  // stop any ongoing polling
   if (currentPoll) {
     clearInterval(currentPoll);
     currentPoll = null;
@@ -62,6 +83,45 @@ function clearHistoryUI() {
   if (tbody) tbody.innerHTML = '';
   historySection.classList.add('hidden');
 }
+
+function clearAuthMessages() {
+  authMsg.textContent = '';
+  registerMsg.textContent = '';
+  if (confirmMsg) confirmMsg.textContent = '';
+}
+
+function setWelcome(name) {
+  if (name && welcomeName && welcomeBox) {
+    welcomeName.textContent = name;
+    welcomeBox.classList.remove('hidden');
+  } else if (name) {
+    authMsg.textContent = `✅ Welcome, ${name}`;
+  }
+}
+
+function clearWelcome() {
+  if (welcomeName) welcomeName.textContent = '';
+  if (welcomeBox) welcomeBox.classList.add('hidden');
+}
+
+function showMfaUI(message) {
+  if (mfaMsg && message) mfaMsg.textContent = message;
+  if (mfaSection) mfaSection.classList.remove('hidden');
+  if (mfaCodeInput) {
+    mfaCodeInput.value = '';
+    mfaCodeInput.focus();
+  }
+}
+
+function hideMfaUI() {
+  if (mfaSection) mfaSection.classList.add('hidden');
+  if (mfaMsg) mfaMsg.textContent = '';
+  if (mfaCodeInput) mfaCodeInput.value = '';
+  // clear state
+  mfaSession = null;
+  mfaChallengeName = null;
+  mfaUsername = null;
+}
 // -----------------------------
 
 function setAuthUI(loggedIn) {
@@ -69,7 +129,6 @@ function setAuthUI(loggedIn) {
     authSection.classList.add('hidden');
     uploadSection.classList.remove('hidden');
     logoutBtn.classList.remove('hidden');
-    // keep the table for this user; just reset the status UI
     resetStatusUI();
   } else {
     authSection.classList.remove('hidden');
@@ -77,9 +136,11 @@ function setAuthUI(loggedIn) {
     logoutBtn.classList.add('hidden');
     historySection.classList.add('hidden');
     token = null;
-    // on logout, hide status and clear the table to avoid showing previous user's data
     resetStatusUI();
     clearHistoryUI();
+    clearAuthMessages();
+    clearWelcome();
+    hideMfaUI();
   }
 }
 
@@ -142,9 +203,26 @@ document.getElementById('history').addEventListener('click', async (e) => {
   }
 });
 
+// Fetch /api/me and show welcome
+async function showWelcomeFromMe() {
+  try {
+    const resp = await api('/api/me');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const name = (data?.user?.username || data?.user?.email || '').trim();
+    if (name) setWelcome(name);
+  } catch {
+    // ignore
+  }
+}
+
+// --------- Auth flows ---------
 loginBtn.addEventListener('click', async () => {
-  const username = document.getElementById('username').value;
+  const username = document.getElementById('username').value.trim();
   const password = document.getElementById('password').value;
+
+  lastLogin = { username, password }; // so we can resend a new OTP
+
   try {
     const resp = await fetch('/api/login', {
       method: 'POST',
@@ -153,21 +231,115 @@ loginBtn.addEventListener('click', async () => {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Login failed');
-    token = data.idToken || data.token; // prefer ID token (has email)
-    authMsg.textContent = '✅ Logged in';
-    setAuthUI(true);          // resets status UI, keeps table visible
-    await loadHistory();      // fetch and show this user's historical videos
+
+    // Tokens right away?
+    if (data.idToken || data.token) {
+      token = data.idToken || data.token;
+      setAuthUI(true);
+      await showWelcomeFromMe();
+      await loadHistory();
+      return;
+    }
+
+    // MFA required (EMAIL_OTP preferred/auto-selected)
+    if (data.mfaRequired && data.session && data.challengeName) {
+      mfaSession = data.session;
+      mfaChallengeName = data.challengeName; // 'EMAIL_OTP'
+      mfaUsername = username;
+
+      const where = data?.parameters?.CODE_DELIVERY_DESTINATION || 'your email';
+      showMfaUI(`We sent a one-time code to ${where}. Enter it below.`);
+      return;
+    }
+
+    throw new Error('Unexpected login response.');
   } catch (err) {
     authMsg.textContent = '❌ ' + err.message;
+  }
+});
+
+// Verify MFA code
+mfaSubmitBtn?.addEventListener('click', async () => {
+  const code = mfaCodeInput?.value?.trim();
+  if (!mfaUsername || !mfaSession || !mfaChallengeName) {
+    if (mfaMsg) mfaMsg.textContent = 'Session expired. Please log in again.';
+    return;
+  }
+  if (!code) {
+    if (mfaMsg) mfaMsg.textContent = 'Enter the 6-digit code from your email.';
+    mfaCodeInput?.focus();
+    return;
+  }
+
+  try {
+    const rr = await fetch('/api/mfa/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: mfaUsername,
+        code,
+        session: mfaSession,
+        challengeName: mfaChallengeName // 'EMAIL_OTP'
+      })
+    });
+    const rj = await rr.json();
+    if (!rr.ok) throw new Error(rj.error || 'MFA verification failed');
+
+    token = rj.idToken || rj.token;
+    hideMfaUI();
+    setAuthUI(true);
+    await showWelcomeFromMe();
+    await loadHistory();
+  } catch (err) {
+    if (mfaMsg) mfaMsg.textContent = '❌ ' + err.message;
+  }
+});
+
+// Resend MFA code (re-runs /login, which triggers a new EMAIL_OTP)
+mfaResendBtn?.addEventListener('click', async () => {
+  if (!lastLogin?.username || !lastLogin?.password) {
+    if (mfaMsg) mfaMsg.textContent = 'Enter your username and password again to resend the code.';
+    return;
+  }
+  try {
+    const resp = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(lastLogin)
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not resend code');
+
+    if (data.mfaRequired && data.session && data.challengeName) {
+      mfaSession = data.session;
+      mfaChallengeName = data.challengeName;
+      mfaUsername = lastLogin.username;
+      const where = data?.parameters?.CODE_DELIVERY_DESTINATION || 'your email';
+      showMfaUI(`We sent a new code to ${where}.`);
+    } else {
+      // If tokens came back (pool might have changed), complete login
+      if (data.idToken || data.token) {
+        token = data.idToken || data.token;
+        hideMfaUI();
+        setAuthUI(true);
+        await showWelcomeFromMe();
+        await loadHistory();
+        return;
+      }
+      throw new Error('Unexpected response while resending code.');
+    }
+  } catch (err) {
+    if (mfaMsg) mfaMsg.textContent = '❌ ' + err.message;
   }
 });
 
 logoutBtn.addEventListener('click', () => {
   token = null;
   authMsg.textContent = 'Logged out';
-  // hide/clear the status area and clear table for privacy
   resetStatusUI();
   clearHistoryUI();
+  clearWelcome();
+  hideMfaUI();
   setAuthUI(false);
 });
 
@@ -187,13 +359,49 @@ registerBtn.addEventListener('click', async () => {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Registration failed');
-    const where = data.codeDelivery?.Destination ? ` → ${data.codeDelivery.Destination}` : '';
+    const where = data.codeDelivery?.destination ? ` → ${data.codeDelivery.destination}` : '';
     registerMsg.textContent = '✅ Registered. Check your email for a code' + where;
+
+    const confirmUsernameEl = document.getElementById('confirmUsername');
+    if (confirmUsernameEl && !confirmUsernameEl.value) confirmUsernameEl.value = username;
   } catch (err) {
     registerMsg.textContent = '❌ ' + err.message;
   }
 });
 
+// Account confirmation (post-signup email code)
+confirmBtn?.addEventListener('click', async () => {
+  const username =
+    document.getElementById('confirmUsername')?.value?.trim() ||
+    document.getElementById('regUsername')?.value?.trim() ||
+    document.getElementById('username')?.value?.trim() ||
+    '';
+  const code = document.getElementById('confirmCode')?.value?.trim();
+
+  if (!username || !code) {
+    if (confirmMsg) confirmMsg.textContent = '❌ Enter your username and the code from the email.';
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, code })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Confirmation failed');
+
+    if (confirmMsg) confirmMsg.textContent = '✅ Confirmed! You can now log in.';
+    const loginU = document.getElementById('username');
+    if (loginU) loginU.value = username;
+    document.getElementById('password')?.focus();
+  } catch (err) {
+    if (confirmMsg) confirmMsg.textContent = '❌ ' + err.message;
+  }
+});
+
+// --------- Upload flow ---------
 function uploadWithProgress(url, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -228,14 +436,13 @@ uploadForm.addEventListener('submit', async (e) => {
   downloadBtn.classList.add('hidden');
   downloadBtn.onclick = null;
 
-  // If another poll is running (previous user/session), stop it
   if (currentPoll) {
     clearInterval(currentPoll);
     currentPoll = null;
   }
 
   try {
-    // 1) Request presigned PUT
+    // 1) Presigned PUT
     const pre = await api('/api/s3/presign-upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -247,13 +454,13 @@ uploadForm.addEventListener('submit', async (e) => {
     const p = await pre.json();
     if (!pre.ok) throw new Error(p.error || 'Failed to get presigned URL');
 
-    // 2) Upload directly to S3 with progress
+    // 2) Upload
     statusText.textContent = 'Uploading to S3...';
     await uploadWithProgress(p.uploadUrl, file, (pct) => {
       progressBar.value = pct;
     });
 
-    // 3) Start transcode from S3 object (include size & upload time)
+    // 3) Start transcode
     statusText.textContent = 'Queuing transcode...';
     const startResp = await api('/api/transcode/start', {
       method: 'POST',
@@ -292,7 +499,7 @@ uploadForm.addEventListener('submit', async (e) => {
           if (!d.ok) return alert(j.error || 'Download failed');
           const a = document.createElement('a');
           a.href = j.downloadUrl;
-          a.download = ''; // ignored cross-origin, but server header now forces download
+          a.download = ''; // ignored cross-origin, server forces Content-Disposition
           a.rel = 'noopener';
           document.body.appendChild(a);
           a.click();
